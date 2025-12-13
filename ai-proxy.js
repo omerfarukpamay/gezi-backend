@@ -4,6 +4,32 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
+// Load local .env for dev (without overriding real environment variables).
+// Render/production should use environment variables set in the service settings.
+(() => {
+  try {
+    const envPath = path.join(__dirname, '.env');
+    if (!fs.existsSync(envPath)) return;
+    const raw = fs.readFileSync(envPath, 'utf-8');
+    raw.split(/\r?\n/).forEach((line) => {
+      const trimmed = String(line || '').trim();
+      if (!trimmed || trimmed.startsWith('#')) return;
+      const eq = trimmed.indexOf('=');
+      if (eq <= 0) return;
+      const key = trimmed.slice(0, eq).trim();
+      let value = trimmed.slice(eq + 1).trim();
+      if (!key) return;
+      if (process.env[key] !== undefined) return;
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      process.env[key] = value;
+    });
+  } catch (e) {
+    console.warn('[env] Failed to load local .env file.');
+  }
+})();
+
 // Use global fetch (Node 18+) or fallback
 const fetchFn = global.fetch || ((...args) => import('node-fetch').then(({ default: f }) => f(...args)));
 
@@ -21,7 +47,10 @@ app.use((req, res, next) => {
 
 const API_URL = 'https://api.openai.com/v1/chat/completions';
 const PORT = process.env.PORT || 3001;
-const API_KEY = process.env.OPENAI_API_KEY;
+const API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_KEY;
+const CTA_TRAIN_TRACKER_KEY = process.env.CTA_TRAIN_TRACKER_KEY;
+
+const { findNearby: findNearbyGtfsTransit } = require('./gtfs-cta.js');
 
 // ----- lightweight user store + auth -----
 const USERS_FILE = path.join(__dirname, 'users.json');
@@ -97,7 +126,7 @@ function authMiddleware(req, res, next) {
   next();
 }
 
-if (!API_KEY) console.warn('[ai-proxy] Missing OPENAI_API_KEY in environment.');
+if (!API_KEY) console.warn('[ai-proxy] Missing OPENAI_API_KEY (or OPENAI_KEY) in environment.');
 
 // ----- Auth routes -----
 app.post('/api/register', (req, res) => {
@@ -171,6 +200,80 @@ app.post('/api/ai', async (req, res) => {
   } catch (err) {
     console.error('[ai-proxy] error', err);
     res.status(500).send('AI proxy error');
+  }
+});
+
+// ----- CTA Train Tracker proxy (keeps API key server-side) -----
+app.get('/api/cta/train-arrivals', async (req, res) => {
+  try {
+    const mapid = String(req.query.mapid || '').trim();
+    const max = Math.max(1, Math.min(10, Number(req.query.max) || 6));
+    if (!mapid) return res.status(400).json({ error: 'mapid is required' });
+    if (!CTA_TRAIN_TRACKER_KEY) return res.status(501).json({ error: 'server missing CTA_TRAIN_TRACKER_KEY' });
+
+    const url = new URL('https://lapi.transitchicago.com/api/1.0/ttarrivals.aspx');
+    url.searchParams.set('key', CTA_TRAIN_TRACKER_KEY);
+    url.searchParams.set('mapid', mapid);
+    url.searchParams.set('max', String(max));
+    url.searchParams.set('outputType', 'JSON');
+
+    const upstream = await fetchFn(url.toString());
+    if (!upstream.ok) {
+      const errText = await upstream.text().catch(() => '');
+      return res.status(upstream.status).json({ error: errText || 'CTA request failed' });
+    }
+    const json = await upstream.json().catch(() => ({}));
+    const eta = json?.ctatt?.eta;
+    const list = Array.isArray(eta) ? eta : (eta ? [eta] : []);
+
+    const now = Date.now();
+    const arrivals = list
+      .map((item) => {
+        const route = String(item?.rt || '').trim();
+        const destination = String(item?.destNm || '').trim();
+        const arrT = String(item?.arrT || '').trim();
+        const isApp = String(item?.isApp || '').trim() === '1';
+        const isDly = String(item?.isDly || '').trim() === '1';
+        const isSch = String(item?.isSch || '').trim() === '1';
+        let minutes = null;
+        if (arrT) {
+          const ts = Date.parse(arrT);
+          if (!Number.isNaN(ts)) minutes = Math.max(0, Math.round((ts - now) / 60000));
+        }
+        return {
+          route: route || 'Train',
+          destination: destination || 'Unknown',
+          minutes,
+          isApproaching: isApp,
+          isDelayed: isDly,
+          isScheduled: isSch
+        };
+      })
+      .filter(a => a && typeof a.minutes === 'number')
+      .sort((a, b) => a.minutes - b.minutes);
+
+    return res.json({ arrivals });
+  } catch (err) {
+    console.error('[cta] error', err);
+    return res.status(500).json({ error: 'CTA proxy error' });
+  }
+});
+
+// ----- GTFS (CTA) nearby transit (bus + train, no key) -----
+app.get('/api/transit/nearby', async (req, res) => {
+  try {
+    const lat = Number(req.query.lat);
+    const lng = Number(req.query.lng);
+    const radius = Math.max(200, Math.min(5000, Number(req.query.radius) || 1200));
+    const limit = Math.max(3, Math.min(25, Number(req.query.limit) || 12));
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({ error: 'lat and lng are required' });
+    }
+    const data = await findNearbyGtfsTransit({ fetchFn, lat, lng, radiusMeters: radius, limit });
+    return res.json({ ...data, source: 'cta_gtfs' });
+  } catch (err) {
+    console.error('[gtfs] error', err);
+    return res.status(500).json({ error: 'GTFS transit lookup failed' });
   }
 });
 

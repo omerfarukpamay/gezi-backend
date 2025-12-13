@@ -1,7 +1,10 @@
 node_modules/
-
+.cache/
 .env
-.env.*
-*.log
-backend.err
 backend.log
+backend.err
+users.json
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
