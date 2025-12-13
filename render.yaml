@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: gezi-backend
+    env: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true

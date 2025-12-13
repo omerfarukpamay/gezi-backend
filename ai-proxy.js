@@ -45,6 +45,10 @@ app.use((req, res, next) => {
   next();
 });
 
+app.get('/health', (req, res) => {
+  res.status(200).json({ ok: true, ts: new Date().toISOString() });
+});
+
 const API_URL = 'https://api.openai.com/v1/chat/completions';
 const PORT = process.env.PORT || 3001;
 const API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_KEY;
